@@ -85,6 +85,8 @@ import org.irods.jargon.core.pub.domain.UserGroup;
 import org.irods.jargon.core.pub.io.FileIOOperations;
 import org.irods.jargon.core.pub.io.IRODSFile;
 import org.irods.jargon.core.pub.io.IRODSFileFactory;
+import org.irods.jargon.core.pub.io.IRODSFileInputStream;
+import org.irods.jargon.core.pub.io.IRODSFileOutputStream;
 import org.irods.jargon.core.pub.io.IRODSRandomAccessFile;
 import org.irods.jargon.core.query.CollectionAndDataObjectListingEntry;
 import org.irods.jargon.core.query.CollectionAndDataObjectListingEntry.ObjectType;
@@ -1353,6 +1355,104 @@ public class IRODSVirtualFileSystem implements VirtualFileSystem, AclCheckable
         }
     }
 
+    private void truncate(Inode _inode, Stat _stat) throws IOException
+    {
+        long inodeNumber = toInodeNumber(_inode);
+        Path path = getPath(inodeNumber);
+
+        log_.debug("truncate - Requested size  = {}", _stat.getSize());
+
+        IRODSAccount acct = getCurrentIRODSUser().getAccount();
+
+        try
+        {
+            IRODSFileFactory ff = factory_.getIRODSFileFactory(acct);
+            IRODSFile file = ff.instanceIRODSFile(path.toString());
+
+            try (AutoClosedIRODSFile ac = new AutoClosedIRODSFile(file))
+            {
+                // Delete everything in the data object.
+                if (_stat.getSize() == 0)
+                {
+                    log_.trace("truncate - Erasing the contents of the data object ...");
+                    file.delete();
+                    file.createNewFile();
+                    return;
+                }
+
+                final int CHUNK_SIZE = 4096;
+                final long size_diff = _stat.getSize() - file.length();
+
+                // Increase the size of the data object.
+                if (size_diff > 0)
+                {
+                    log_.trace("truncate - Increasing the size of the data object by {} ...", size_diff);
+
+                    byte[] chunk = new byte[CHUNK_SIZE];
+                    final long full_chunks = size_diff / CHUNK_SIZE;
+                    final long remaining_bytes = size_diff % CHUNK_SIZE;
+
+                    // Open the data object in append mode.
+                    try (IRODSFileOutputStream fos = ff.instanceIRODSFileOutputStream(file, OpenFlags.READ_WRITE))
+                    {
+                        for (int i = 0; i < full_chunks; ++i)
+                        {
+                            fos.write(chunk);
+                        }
+
+                        if (remaining_bytes > 0)
+                        {
+                            fos.write(chunk, 0, (int) remaining_bytes);
+                        }
+                    }
+                }
+                else if (size_diff < 0) // Truncate the size of the data object.
+                {
+                    log_.trace("truncate - Decreasing the size of the data object by {} ...", size_diff);
+
+                    String newExt = ".temp_" + toInodeNumber(_inode);
+                    IRODSFile tempFile = ff.instanceIRODSFile(path.toString() + newExt);
+
+                    byte[] chunk = new byte[CHUNK_SIZE];
+                    final long full_chunks = _stat.getSize() / CHUNK_SIZE;
+                    final long remaining_bytes = _stat.getSize() % CHUNK_SIZE;
+
+                    // @formatter:off
+                    try (AutoClosedIRODSFile ac1 = new AutoClosedIRODSFile(tempFile);
+                         IRODSFileInputStream fis = ff.instanceIRODSFileInputStream(file);
+                         IRODSFileOutputStream fos = ff.instanceIRODSFileOutputStream(tempFile))
+                    // @formatter:on
+                    {
+                        for (int i = 0; i < full_chunks; ++i)
+                        {
+                            fis.read(chunk);
+                            fos.write(chunk);
+                        }
+
+                        if (remaining_bytes > 0)
+                        {
+                            fis.read(chunk, 0, (int) remaining_bytes);
+                            fos.write(chunk, 0, (int) remaining_bytes);
+                        }
+                    }
+
+                    // Rename data objects.
+                    file.delete();
+                    tempFile.renameTo(file);
+                }
+            }
+        }
+        catch (JargonException e)
+        {
+            log_.error(e.getMessage());
+            throw new IOException(e);
+        }
+        finally
+        {
+            closeCurrentConnection();
+        }
+    }
+
     @Override
     public void setattr(Inode _inode, Stat _stat) throws IOException
     {
@@ -1369,7 +1469,7 @@ public class IRODSVirtualFileSystem implements VirtualFileSystem, AclCheckable
 
         if (_stat.isDefined(Stat.StatAttribute.SIZE))
         {
-            log_.warn("setattr - Adjusting the size is not supported");
+            truncate(_inode, _stat);
         }
     }
 
